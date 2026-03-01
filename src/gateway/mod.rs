@@ -812,6 +812,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  🌐 Web Dashboard: http://{display_addr}/");
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
+    println!("  POST /forward   — {{\"message\": \"...\"}} (autonomous tool execution, returns final answer)");
     println!("  POST /api/chat  — {{\"message\": \"...\", \"context\": [...]}} (tools-enabled, OpenClaw compat)");
     if whatsapp_channel.is_some() {
         println!("  GET  /whatsapp  — Meta webhook verification");
@@ -941,6 +942,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/webhook", get(handle_webhook_usage).post(handle_webhook))
+        .route("/forward", post(handle_forward))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
@@ -1984,6 +1986,200 @@ pub struct WhatsAppVerifyQuery {
     pub verify_token: Option<String>,
     #[serde(rename = "hub.challenge")]
     pub challenge: Option<String>,
+}
+
+/// POST /forward — Autonomous tool execution endpoint
+///
+/// Similar to /webhook but executes the full agent loop autonomously,
+/// running tools and returning the final natural language response instead
+/// of raw tool calls. Useful for external integrations that want a complete
+/// answer without implementing their own agentic loop.
+async fn handle_forward(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("/forward rate limit exceeded");
+        let err = serde_json::json!({
+            "error": "Too many forward requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err)).into_response();
+    }
+
+    // Require at least one auth layer for non-loopback traffic
+    if !state.pairing.require_pairing()
+        && state.webhook_secret_hash.is_none()
+        && !is_loopback_request(Some(peer_addr), &headers, state.trust_forwarded_headers)
+    {
+        tracing::warn!(
+            "Forward: rejected unauthenticated non-loopback request"
+        );
+        let err = serde_json::json!({
+            "error": "Unauthorized — configure pairing or X-Webhook-Secret for non-local forward access"
+        });
+        return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
+    }
+
+    // ── Bearer token auth (pairing) ──
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            tracing::warn!("Forward: rejected — not paired / invalid bearer token");
+            let err = serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            });
+            return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
+        }
+    }
+
+    // ── Webhook secret auth (optional, additional layer) ──
+    if let Some(ref secret_hash) = state.webhook_secret_hash {
+        let header_hash = headers
+            .get("X-Webhook-Secret")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(hash_webhook_secret);
+        match header_hash {
+            Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
+            _ => {
+                tracing::warn!("Forward: rejected request — invalid or missing X-Webhook-Secret");
+                let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Secret header"});
+                return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
+            }
+        }
+    }
+
+    // ── Parse body ──
+    let Json(webhook_body) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("Forward JSON parse error: {e}");
+            let err = serde_json::json!({
+                "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
+            });
+            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        }
+    };
+
+    // ── Idempotency (optional) ──
+    if let Some(idempotency_key) = headers
+        .get("X-Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !state.idempotency_store.record_if_new(idempotency_key) {
+            tracing::info!("Forward duplicate ignored (idempotency key: {idempotency_key})");
+            let body = serde_json::json!({
+                "status": "duplicate",
+                "idempotent": true,
+                "message": "Request already processed for this idempotency key"
+            });
+            return (StatusCode::OK, Json(body)).into_response();
+        }
+    }
+
+    let message = webhook_body.message.trim();
+    let webhook_session_id = webhook_body
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if message.is_empty() {
+        let err = serde_json::json!({
+            "error": "The `message` field is required and must be a non-empty string."
+        });
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    }
+
+    if state.auto_save {
+        let key = webhook_memory_key();
+        let _ = state
+            .mem
+            .store(
+                &key,
+                message,
+                MemoryCategory::Conversation,
+                webhook_session_id,
+            )
+            .await;
+    }
+
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let model_label = state.model.clone();
+    let started_at = Instant::now();
+
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::AgentStart {
+            provider: provider_label.clone(),
+            model: model_label.clone(),
+        });
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::LlmRequest {
+            provider: provider_label.clone(),
+            model: model_label.clone(),
+            messages_count: 1,
+        });
+
+    // Execute full agent loop with tools (autonomous execution)
+    let config = state.config.lock().clone();
+    match crate::agent::process_message(config, message).await {
+        Ok(response) => {
+            let duration = started_at.elapsed();
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: model_label,
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                });
+
+            let body = serde_json::json!({
+                "status": "ok",
+                "response": response
+            });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(err) => {
+            tracing::error!("Forward execution failed: {err:?}");
+            let duration = started_at.elapsed();
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: model_label,
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                });
+
+            let body = serde_json::json!({
+                "status": "error",
+                "error": err.to_string()
+            });
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+        }
+    }
 }
 
 /// GET /whatsapp — Meta webhook verification
