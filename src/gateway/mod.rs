@@ -124,6 +124,95 @@ fn gateway_message_session_id(msg: &crate::channels::traits::ChannelMessage) -> 
     }
 }
 
+/// Parse media ID and label from a message formatted by WhatsApp channel's `format_media_content`.
+///
+/// # Examples
+///   `"[Image] (id: img123)"` → `Some(("img123", "[Image]"))`
+///   `"[Document: file.pdf] (id: doc456)\n\nCaption"` → `Some(("doc456", "[Document: file.pdf]"))`
+fn parse_media_id(content: &str) -> Option<(&str, &str)> {
+    // Media messages start with '[' and contain ' (id: ...)'
+    if !content.starts_with('[') {
+        return None;
+    }
+    let id_marker = " (id: ";
+    let id_start = content.find(id_marker)? + id_marker.len();
+    let id_end = content[id_start..].find(')')? + id_start;
+    let media_id = &content[id_start..id_end];
+
+    // Label is everything before " (id: "
+    let label_end = content.find(id_marker)?;
+    let label = &content[..label_end];
+
+    Some((media_id, label))
+}
+
+/// Download a WhatsApp media file to the workspace.
+///
+/// WhatsApp Cloud API media download is a two-step process:
+/// 1. `GET /v18.0/{media_id}` → returns JSON with `{url: "..."}` (temporary CDN URL)
+/// 2. `GET {url}` → downloads the actual binary content
+///
+/// Returns `Ok(local_path)` on success, or an error if any step fails.
+async fn fetch_whatsapp_media(
+    access_token: &str,
+    media_id: &str,
+    filename: &str,
+    workspace_dir: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let client = crate::config::build_runtime_proxy_client("channel.whatsapp");
+
+    // Step 1: Resolve media URL
+    let meta_url = format!("https://graph.facebook.com/v18.0/{media_id}");
+    let resp = client
+        .get(&meta_url)
+        .bearer_auth(access_token)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("WhatsApp media URL lookup failed: {status} — {body}");
+    }
+
+    let meta_json: serde_json::Value = resp.json().await?;
+    let download_url = meta_json
+        .get("url")
+        .and_then(|u| u.as_str())
+        .ok_or_else(|| anyhow::anyhow!("WhatsApp media response missing 'url' field"))?;
+
+    // Step 2: Download the actual file
+    let file_resp = client
+        .get(download_url)
+        .bearer_auth(access_token)
+        .send()
+        .await?;
+
+    if !file_resp.status().is_success() {
+        let status = file_resp.status();
+        anyhow::bail!("WhatsApp media download failed: {status}");
+    }
+
+    let bytes = file_resp.bytes().await?;
+
+    // Save to workspace/whatsapp-media/
+    let media_dir = workspace_dir.join("whatsapp-media");
+    tokio::fs::create_dir_all(&media_dir).await?;
+
+    // Use media_id prefix to avoid filename collisions
+    let safe_filename = format!("{media_id}_{filename}");
+    let file_path = media_dir.join(&safe_filename);
+    tokio::fs::write(&file_path, &bytes).await?;
+
+    tracing::info!(
+        "WhatsApp media saved: {} ({} bytes)",
+        file_path.display(),
+        bytes.len()
+    );
+
+    Ok(file_path)
+}
+
 fn hash_webhook_secret(value: &str) -> String {
     use sha2::{Digest, Sha256};
 
