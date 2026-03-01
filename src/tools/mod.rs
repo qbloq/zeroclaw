@@ -43,6 +43,7 @@ pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
 pub mod glob_search;
+pub mod graphjin;
 #[cfg(feature = "hardware")]
 pub mod hardware_board_info;
 #[cfg(feature = "hardware")]
@@ -114,6 +115,7 @@ pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
+pub use graphjin::GraphJinTool;
 #[cfg(feature = "hardware")]
 pub use hardware_board_info::HardwareBoardInfoTool;
 #[cfg(feature = "hardware")]
@@ -590,6 +592,17 @@ pub fn all_tools_with_runtime(
             root_config.web_search.exa_search_type.clone(),
             root_config.web_search.exa_include_text,
             root_config.web_search.jina_site_filters.clone(),
+        )));
+    }
+
+    // GraphJin database query tool (config-gated)
+    if root_config.graphjin.enabled {
+        tool_arcs.push(Arc::new(GraphJinTool::new(
+            security.clone(),
+            root_config.graphjin.api_url.clone(),
+            root_config.graphjin.timeout_secs,
+            root_config.graphjin.max_response_size,
+            root_config.graphjin.allow_mutations,
         )));
     }
 

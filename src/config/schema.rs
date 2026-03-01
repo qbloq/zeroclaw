@@ -336,6 +336,10 @@ pub struct Config {
     #[serde(default)]
     pub web_search: WebSearchConfig,
 
+    /// GraphJin database query tool configuration (`[graphjin]`).
+    #[serde(default)]
+    pub graphjin: GraphJinConfig,
+
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     pub proxy: ProxyConfig,
@@ -2298,6 +2302,58 @@ fn default_web_search_retry_backoff_ms() -> u64 {
 
 fn default_web_search_exa_search_type() -> String {
     "auto".into()
+}
+
+// ── GraphJin ────────────────────────────────────────────────────
+
+/// GraphJin database query tool configuration (`[graphjin]` section).
+///
+/// Allows the agent to discover the schema and execute GraphQL queries against a
+/// running GraphJin service. GraphJin auto-discovers database schema, understands
+/// relationships, and compiles GraphQL to optimised SQL.
+///
+/// Deny-by-default: set `enabled = true` to activate the tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GraphJinConfig {
+    /// Enable the `graphjin` tool for natural-language database queries
+    #[serde(default)]
+    pub enabled: bool,
+    /// GraphJin API base URL (e.g. "http://localhost:8080")
+    #[serde(default = "default_graphjin_api_url")]
+    pub api_url: String,
+    /// Request timeout in seconds (default: 30)
+    #[serde(default = "default_graphjin_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Maximum response size in bytes (default: 1MB)
+    #[serde(default = "default_graphjin_max_response_size")]
+    pub max_response_size: usize,
+    /// Allow mutation operations (insert/update/delete). Disabled by default.
+    #[serde(default)]
+    pub allow_mutations: bool,
+}
+
+fn default_graphjin_api_url() -> String {
+    "http://localhost:8080".into()
+}
+
+fn default_graphjin_timeout_secs() -> u64 {
+    30
+}
+
+fn default_graphjin_max_response_size() -> usize {
+    1_000_000 // 1MB
+}
+
+impl Default for GraphJinConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: default_graphjin_api_url(),
+            timeout_secs: default_graphjin_timeout_secs(),
+            max_response_size: default_graphjin_max_response_size(),
+            allow_mutations: false,
+        }
+    }
 }
 
 const BROWSER_OPEN_ALLOWED_VALUES: &[&str] = &[
@@ -6572,6 +6628,7 @@ impl Default for Config {
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            graphjin: GraphJinConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -10496,6 +10553,7 @@ ws_url = "ws://127.0.0.1:3002"
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            graphjin: GraphJinConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
@@ -10884,6 +10942,7 @@ denied_tools = ["shell"]
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            graphjin: GraphJinConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
