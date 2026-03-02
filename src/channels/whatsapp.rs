@@ -2,6 +2,49 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use uuid::Uuid;
 
+/// Extract media content from a WhatsApp webhook message object.
+/// Returns `Some(content_string)` for supported media types (image, audio, video, document, sticker),
+/// or `None` for unsupported types (location, contacts, etc.).
+fn format_media_content(msg: &serde_json::Value) -> Option<String> {
+    let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    // Media types that have an object with at least an "id" field
+    let media_obj = match msg_type {
+        "image" | "audio" | "video" | "document" | "sticker" => msg.get(msg_type),
+        _ => return None,
+    }?;
+
+    let media_id = media_obj.get("id").and_then(|id| id.as_str())?;
+
+    // Build the label (e.g. "[Document: report.pdf]" or "[Image]")
+    let label = match msg_type {
+        "document" => {
+            let filename = media_obj
+                .get("filename")
+                .and_then(|f| f.as_str())
+                .unwrap_or("file");
+            format!("[Document: {filename}]")
+        }
+        "image" => "[Image]".to_string(),
+        "audio" => "[Audio]".to_string(),
+        "video" => "[Video]".to_string(),
+        "sticker" => "[Sticker]".to_string(),
+        _ => format!("[Media: {msg_type}]"),
+    };
+
+    let mut content = format!("{label} (id: {media_id})");
+
+    // Append caption if present (common for image, video, document)
+    if let Some(caption) = media_obj.get("caption").and_then(|c| c.as_str()) {
+        if !caption.is_empty() {
+            content.push_str("\n\n");
+            content.push_str(caption);
+        }
+    }
+
+    Some(content)
+}
+
 /// `WhatsApp` channel — uses `WhatsApp` Business Cloud API
 ///
 /// This channel operates in webhook mode (push-based) rather than polling.
@@ -46,6 +89,11 @@ impl WhatsAppChannel {
 
     fn http_client(&self) -> reqwest::Client {
         crate::config::build_runtime_proxy_client("channel.whatsapp")
+    }
+
+    /// Get the access token (used by gateway for media downloads)
+    pub fn access_token(&self) -> &str {
+        &self.access_token
     }
 
     /// Check if a phone number is allowed (E.164 format: +1234567890)
@@ -105,7 +153,7 @@ impl WhatsAppChannel {
                         continue;
                     }
 
-                    // Extract text content (support text messages only for now)
+                    // Extract content — text messages or media (image/audio/video/document/sticker)
                     let content = if let Some(text_obj) = msg.get("text") {
                         text_obj
                             .get("body")
@@ -113,9 +161,17 @@ impl WhatsAppChannel {
                             .unwrap_or("")
                             .to_string()
                     } else {
-                        // Could be image, audio, etc. — skip for now
-                        tracing::debug!("WhatsApp: skipping non-text message from {from}");
-                        continue;
+                        // Try to extract media content (image, audio, video, document, sticker)
+                        match format_media_content(msg) {
+                            Some(media_content) => media_content,
+                            None => {
+                                // Unsupported type (location, contacts, etc.) — skip
+                                tracing::debug!(
+                                    "WhatsApp: skipping unsupported message type from {from}"
+                                );
+                                continue;
+                            }
+                        }
                     };
 
                     if content.is_empty() {
