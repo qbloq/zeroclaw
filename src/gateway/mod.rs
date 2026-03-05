@@ -1002,7 +1002,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .layer(middleware::from_fn(security_headers_middleware))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(config.gateway.request_timeout_secs),
         ))
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));

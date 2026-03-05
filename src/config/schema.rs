@@ -1784,6 +1784,10 @@ pub struct GatewayConfig {
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
 
+    /// Request timeout in seconds (default: 30). Increase for long-running LLM operations.
+    #[serde(default = "default_gateway_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+
     /// Node-control protocol scaffold (`[gateway.node_control]`).
     #[serde(default)]
     pub node_control: NodeControlConfig,
@@ -1835,6 +1839,10 @@ fn default_gateway_idempotency_max_keys() -> usize {
     10_000
 }
 
+fn default_gateway_request_timeout_secs() -> u64 {
+    30
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1853,6 +1861,7 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            request_timeout_secs: default_gateway_request_timeout_secs(),
             node_control: NodeControlConfig::default(),
         }
     }
