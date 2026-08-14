@@ -3320,6 +3320,10 @@ async fn process_whatsapp_message(
     });
     drop(approvals);
 
+    // FastAck: Meta treats a slow ack as a failed delivery and REDELIVERS the
+    // webhook with backoff for days, re-running the agent once per redelivery.
+    // Redeliveries that still arrive are dropped by wamid in
+    // WhatsAppChannel::parse_webhook_payload.
     let channel: Arc<dyn Channel> = wa.clone();
     webhook_ingress::dispatch_verified_webhook(
         state,
@@ -3328,7 +3332,7 @@ async fn process_whatsapp_message(
             channel,
             memory_key: whatsapp_memory_key,
             agent_override: None,
-            mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+            mode: webhook_ingress::WebhookDispatchMode::FastAck,
             #[cfg(test)]
             suppress_reply_send: true,
         },
@@ -7863,15 +7867,16 @@ path = "{trigger_path}"
 
     // handler must return 200 OK before the (potentially
     // slow) LLM call completes, so Nextcloud Talk doesn't cancel the webhook
-    // request at its ~5s timeout.
-    #[cfg(feature = "channel-nextcloud")]
+    // request at its ~5s timeout. Shared with the WhatsApp Cloud equivalent:
+    // Meta redelivers webhooks that don't ack fast, with backoff, for days.
+    #[cfg(any(feature = "channel-nextcloud", feature = "channel-whatsapp-cloud"))]
     #[derive(Default)]
     struct SlowProvider {
         calls: AtomicUsize,
         started_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     }
 
-    #[cfg(feature = "channel-nextcloud")]
+    #[cfg(any(feature = "channel-nextcloud", feature = "channel-whatsapp-cloud"))]
     #[async_trait]
     impl ModelProvider for SlowProvider {
         async fn chat_with_system(
@@ -7889,7 +7894,7 @@ path = "{trigger_path}"
             Ok("slow ok".into())
         }
     }
-    #[cfg(feature = "channel-nextcloud")]
+    #[cfg(any(feature = "channel-nextcloud", feature = "channel-whatsapp-cloud"))]
     impl ::zeroclaw_api::attribution::Attributable for SlowProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
@@ -9748,6 +9753,72 @@ path = "{trigger_path}"
         ))
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn whatsapp_webhook_returns_before_llm_call_completes() {
+        // Meta's Cloud API treats a slow ack as a failed delivery and
+        // REDELIVERS the webhook — observed in production as one message
+        // ingested 15× (~24s apart, then backoff to next-day), each
+        // redelivery re-running the agent and re-answering the user. The
+        // handler must ack 200 immediately and process in a spawned task,
+        // the way the Nextcloud Talk handler does.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let provider_impl = Arc::new(SlowProvider {
+            calls: AtomicUsize::new(0),
+            started_tx: Mutex::new(Some(started_tx)),
+        });
+
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        let wa = Arc::new(WhatsAppChannel::new(
+            "access-token".into(),
+            "phone-number-id".into(),
+            "verify-tok".into(),
+            "work".to_string(),
+            peer_resolver,
+        ));
+
+        let mut state = webhook_baseline_state();
+        state.model_provider = provider_impl.clone();
+        state.whatsapp = HashMap::from([("work".to_string(), wa)]);
+        state.whatsapp_app_secret =
+            HashMap::from([("work".to_string(), Arc::<str>::from("app-secret"))]);
+
+        let body = br#"{"object":"whatsapp_business_account","entry":[{"id":"e","changes":[{"value":{"messages":[{"from":"1234567890","id":"wamid.ack-test","timestamp":"1699999999","type":"text","text":{"body":"hola"}}]},"field":"messages"}]}]}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&whatsapp_signature("app-secret", body)).unwrap(),
+        );
+
+        let start = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(2),
+            Box::pin(handle_whatsapp_message_alias(
+                State(state),
+                Path("work".to_string()),
+                headers,
+                Bytes::from_static(body),
+            )),
+        )
+        .await
+        .expect("webhook must ack before the 2s deadline, not after the LLM call");
+        let elapsed = start.elapsed();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "handler returned after {elapsed:?}; Meta would have redelivered by now"
+        );
+
+        // The ack must not have skipped processing: the spawned task's LLM
+        // call (still inside its 30s sleep) has actually started.
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("spawned LLM call did not start within 2s")
+            .expect("started_tx sender was dropped");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
     /// Build an `AppState` whose device registry points at a non-existent

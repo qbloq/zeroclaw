@@ -458,7 +458,7 @@ pub(crate) enum WebhookDispatchMode {
     Synchronous,
     /// Acknowledge immediately and process each message in a background
     /// task, for providers that cancel slow webhook deliveries.
-    #[cfg(feature = "channel-nextcloud")]
+    #[cfg(any(feature = "channel-nextcloud", feature = "channel-whatsapp-cloud"))]
     FastAck,
 }
 
@@ -527,7 +527,7 @@ pub(crate) async fn dispatch_verified_webhook(
                 .await;
             }
         }
-        #[cfg(feature = "channel-nextcloud")]
+        #[cfg(any(feature = "channel-nextcloud", feature = "channel-whatsapp-cloud"))]
         WebhookDispatchMode::FastAck => {
             // The provider cancels webhook requests that do not complete
             // quickly; slow local models routinely exceed that. Each message
