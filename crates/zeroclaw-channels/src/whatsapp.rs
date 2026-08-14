@@ -8,6 +8,45 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 
+/// Upper bound on remembered inbound wamids (Meta message ids) used to drop
+/// webhook redeliveries. Bounded FIFO: oldest ids are evicted first.
+pub(crate) const WAMID_DEDUP_CAPACITY: usize = 1024;
+
+/// Bounded FIFO of inbound wamids already dispatched. Meta's Cloud API
+/// delivers webhooks at-least-once and redelivers (with backoff, for days)
+/// whenever the endpoint is slow to ack; the wamid is the only identity that
+/// is stable across those redeliveries.
+struct WamidDedup {
+    queue: std::collections::VecDeque<String>,
+    set: std::collections::HashSet<String>,
+}
+
+impl WamidDedup {
+    fn new() -> Self {
+        Self {
+            queue: std::collections::VecDeque::new(),
+            set: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Record `wamid` as seen. Returns `true` when it is fresh, `false` when
+    /// it was already recorded (a redelivery). Evicts the oldest entry once
+    /// [`WAMID_DEDUP_CAPACITY`] is reached, so memory stays flat.
+    fn check_and_insert(&mut self, wamid: &str) -> bool {
+        if self.set.contains(wamid) {
+            return false;
+        }
+        if self.queue.len() >= WAMID_DEDUP_CAPACITY
+            && let Some(evicted) = self.queue.pop_front()
+        {
+            self.set.remove(&evicted);
+        }
+        self.queue.push_back(wamid.to_string());
+        self.set.insert(wamid.to_string());
+        true
+    }
+}
+
 type PendingApprovalsMap = Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>;
 static PENDING_APPROVALS: LazyLock<Arc<PendingApprovalsMap>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
@@ -40,6 +79,10 @@ pub struct WhatsAppChannel {
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
+    /// Inbound wamids already dispatched, to drop Meta webhook redeliveries.
+    /// std Mutex (not tokio): `parse_webhook_payload` is sync and the lock is
+    /// held only for the check-and-insert.
+    seen_wamids: std::sync::Mutex<WamidDedup>,
 }
 
 impl WhatsAppChannel {
@@ -60,6 +103,7 @@ impl WhatsAppChannel {
             dm_mention_patterns: Vec::new(),
             group_mention_patterns: Vec::new(),
             approval_timeout_secs: 300,
+            seen_wamids: std::sync::Mutex::new(WamidDedup::new()),
         }
     }
 
@@ -223,6 +267,34 @@ impl WhatsAppChannel {
                         continue;
                     };
 
+                    // Drop Meta webhook redeliveries by wamid (`messages[].id`,
+                    // stable across redeliveries). Checked before any other
+                    // filter so a redelivery does the minimum work. Messages
+                    // without a wamid can't be deduped and fall through.
+                    let wamid = msg
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .filter(|id| !id.is_empty());
+                    if let Some(id) = wamid {
+                        let fresh = self
+                            .seen_wamids
+                            .lock()
+                            .expect("wamid dedup lock poisoned")
+                            .check_and_insert(id);
+                        if !fresh {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({"from": from})),
+                                "dropping redelivered WhatsApp webhook message (wamid already seen)"
+                            );
+                            continue;
+                        }
+                    }
+
                     // Check allowlist
                     let normalized_from = if from.starts_with('+') {
                         from.to_string()
@@ -377,7 +449,12 @@ impl WhatsAppChannel {
                         });
 
                     messages.push(ChannelMessage {
-                        id: Uuid::new_v4().to_string(),
+                        // The wamid, when present, is the message's durable
+                        // identity (memory keys, logs); the UUID is only a
+                        // fallback for id-less payloads.
+                        id: wamid
+                            .map(str::to_string)
+                            .unwrap_or_else(|| Uuid::new_v4().to_string()),
                         reply_target: normalized_from.clone(),
                         sender: normalized_from,
                         content,
@@ -1028,6 +1105,106 @@ mod tests {
         assert_eq!(msgs[0].content, "Hello ZeroClaw!");
         assert_eq!(msgs[0].channel, "whatsapp");
         assert_eq!(msgs[0].timestamp, 1_699_999_999);
+    }
+
+    /// Build the canonical Meta webhook envelope around one text message.
+    /// `wamid` is the Cloud API message id (`messages[].id`), stable across
+    /// Meta's webhook redeliveries; `None` omits the field entirely.
+    fn text_message_payload(wamid: Option<&str>, body: &str) -> serde_json::Value {
+        let mut msg = serde_json::json!({
+            "from": "1234567890",
+            "timestamp": "1699999999",
+            "type": "text",
+            "text": { "body": body }
+        });
+        if let Some(id) = wamid {
+            msg["id"] = serde_json::json!(id);
+        }
+        serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "id": "123",
+                "changes": [{
+                    "value": { "messages": [msg] },
+                    "field": "messages"
+                }]
+            }]
+        })
+    }
+
+    #[test]
+    fn whatsapp_channel_message_id_is_the_wamid() {
+        // The wamid is the only identity that survives a Meta redelivery.
+        // Minting a fresh UUID per parse is what made redeliveries
+        // indistinguishable from new messages downstream (memory autosave,
+        // logs), so the wamid must travel as the ChannelMessage id.
+        let ch = make_channel();
+        let msgs = ch.parse_webhook_payload(&text_message_payload(
+            Some("wamid.HBgLMTIzNDU2Nzg5MAA="),
+            "hola",
+        ));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "wamid.HBgLMTIzNDU2Nzg5MAA=");
+    }
+
+    #[test]
+    fn whatsapp_redelivered_wamid_is_dropped() {
+        // Meta redelivers the exact same webhook when the endpoint is slow to
+        // ack (observed in production: one message ingested 15×, ~24s apart,
+        // with backoff up to next-day). The second parse of the same wamid
+        // must yield no messages.
+        let ch = make_channel();
+        let payload = text_message_payload(Some("wamid.redelivered"), "dame el reporte");
+        assert_eq!(ch.parse_webhook_payload(&payload).len(), 1);
+        assert!(
+            ch.parse_webhook_payload(&payload).is_empty(),
+            "a redelivered wamid must be dropped, not re-dispatched to the agent"
+        );
+    }
+
+    #[test]
+    fn whatsapp_distinct_wamids_with_same_content_both_pass() {
+        // Dedup keys on the wamid, never on content: a user legitimately
+        // sending "Hola" twice is two messages.
+        let ch = make_channel();
+        let first = text_message_payload(Some("wamid.first"), "Hola");
+        let second = text_message_payload(Some("wamid.second"), "Hola");
+        assert_eq!(ch.parse_webhook_payload(&first).len(), 1);
+        assert_eq!(ch.parse_webhook_payload(&second).len(), 1);
+    }
+
+    #[test]
+    fn whatsapp_message_without_wamid_is_never_deduped() {
+        // Defensive: a payload missing `messages[].id` cannot be deduped —
+        // it must still parse (with a synthetic id) and never collide with
+        // another id-less message.
+        let ch = make_channel();
+        let payload = text_message_payload(None, "sin id");
+        let first = ch.parse_webhook_payload(&payload);
+        let second = ch.parse_webhook_payload(&payload);
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert!(!first[0].id.is_empty());
+        assert_ne!(first[0].id, second[0].id);
+    }
+
+    #[test]
+    fn whatsapp_wamid_dedup_capacity_evicts_oldest() {
+        // The seen-set is bounded: after WAMID_DEDUP_CAPACITY newer ids, the
+        // oldest is evicted and would pass again. This documents the bound —
+        // memory stays flat no matter how long the process runs.
+        let ch = make_channel();
+        let oldest = text_message_payload(Some("wamid.oldest"), "x");
+        assert_eq!(ch.parse_webhook_payload(&oldest).len(), 1);
+        for i in 0..WAMID_DEDUP_CAPACITY {
+            let p = text_message_payload(Some(&format!("wamid.fill{i}")), "x");
+            assert_eq!(ch.parse_webhook_payload(&p).len(), 1);
+        }
+        assert_eq!(
+            ch.parse_webhook_payload(&oldest).len(),
+            1,
+            "after CAPACITY newer wamids the oldest must have been evicted"
+        );
     }
 
     #[test]

@@ -3101,8 +3101,13 @@ async fn process_whatsapp_message(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    // Process each message
-    for msg in &messages {
+    // Process each message. The approval-reply interception stays ahead of
+    // the ack (an in-memory map op, instant) so a control message is consumed
+    // exactly once; everything that can be slow — the agent turn and the
+    // outbound reply — is spawned, because Meta treats a slow ack as a failed
+    // delivery and REDELIVERS the webhook with backoff for days, re-running
+    // the agent once per redelivery. Same pattern as Nextcloud Talk above.
+    for msg in messages {
         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "whatsapp", "sender": msg.sender, "content": msg.content})), "inbound webhook message");
 
         // Route approval replies to pending approval requests before dispatching to agent
@@ -3115,70 +3120,80 @@ async fn process_whatsapp_message(
             }
         }
 
-        let session_id = sender_session_id("whatsapp", msg);
+        let state = state.clone();
+        let wa = Arc::clone(wa);
+        zeroclaw_spawn::spawn!(async move {
+            let session_id = sender_session_id("whatsapp", &msg);
 
-        // Auto-save to memory
-        if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
-            let key = whatsapp_memory_key(msg);
-            let _ = state
-                .mem
-                .store(
-                    &key,
-                    &msg.content,
-                    MemoryCategory::Conversation,
-                    Some(&session_id),
-                )
-                .await;
-        }
+            // Auto-save to memory
+            if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
+                let key = whatsapp_memory_key(&msg);
+                let _ = state
+                    .mem
+                    .store(
+                        &key,
+                        &msg.content,
+                        MemoryCategory::Conversation,
+                        Some(&session_id),
+                    )
+                    .await;
+            }
 
-        match Box::pin(run_gateway_chat_with_tools(
-            state,
-            &msg.content,
-            Some(&session_id),
-            None,
-        ))
-        .await
-        {
-            Ok(GatewayChatOutcome { response, .. }) => {
-                // Send reply via WhatsApp
-                if let Err(e) = wa
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            match Box::pin(run_gateway_chat_with_tools(
+                &state,
+                &msg.content,
+                Some(&session_id),
+                None,
+            ))
+            .await
+            {
+                Ok(GatewayChatOutcome { response, .. }) => {
+                    // Send reply via WhatsApp
+                    if let Err(e) = wa
+                        .send(&SendMessage::new(response, &msg.reply_target))
+                        .await
+                    {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "Failed to send WhatsApp reply"
-                    );
+                            "Failed to send WhatsApp reply"
+                        );
+                    }
+                }
+                Err(e) => {
+                    let reply = if is_needs_quickstart_err(&e) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            "WhatsApp chat refused: gateway has no model configured; \
+                             visit /quickstart"
+                        );
+                        needs_quickstart_channel_reply()
+                    } else {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(
+                                    ::serde_json::json!({"channel": "whatsapp", "error": format!("{}", e)})
+                                ),
+                            "LLM error"
+                        );
+                        "Sorry, I couldn't process your message right now.".to_string()
+                    };
+                    let _ = wa.send(&SendMessage::new(reply, &msg.reply_target)).await;
                 }
             }
-            Err(e) => {
-                let reply = if is_needs_quickstart_err(&e) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "WhatsApp chat refused: gateway has no model configured; \
-                         visit /quickstart"
-                    );
-                    needs_quickstart_channel_reply()
-                } else {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(
-                                ::serde_json::json!({"channel": "whatsapp", "error": format!("{}", e)})
-                            ),
-                        "LLM error"
-                    );
-                    "Sorry, I couldn't process your message right now.".to_string()
-                };
-                let _ = wa.send(&SendMessage::new(reply, &msg.reply_target)).await;
-            }
-        }
+        });
     }
 
     // Acknowledge the webhook
@@ -6795,15 +6810,16 @@ mod tests {
 
     // handler must return 200 OK before the (potentially
     // slow) LLM call completes, so Nextcloud Talk doesn't cancel the webhook
-    // request at its ~5s timeout.
-    #[cfg(feature = "channel-nextcloud")]
+    // request at its ~5s timeout. Shared with the WhatsApp Cloud equivalent:
+    // Meta redelivers webhooks that don't ack fast, with backoff, for days.
+    #[cfg(any(feature = "channel-nextcloud", feature = "channel-whatsapp-cloud"))]
     #[derive(Default)]
     struct SlowProvider {
         calls: AtomicUsize,
         started_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     }
 
-    #[cfg(feature = "channel-nextcloud")]
+    #[cfg(any(feature = "channel-nextcloud", feature = "channel-whatsapp-cloud"))]
     #[async_trait]
     impl ModelProvider for SlowProvider {
         async fn chat_with_system(
@@ -6821,7 +6837,7 @@ mod tests {
             Ok("slow ok".into())
         }
     }
-    #[cfg(feature = "channel-nextcloud")]
+    #[cfg(any(feature = "channel-nextcloud", feature = "channel-whatsapp-cloud"))]
     impl ::zeroclaw_api::attribution::Attributable for SlowProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
@@ -8359,6 +8375,72 @@ mod tests {
         ))
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn whatsapp_webhook_returns_before_llm_call_completes() {
+        // Meta's Cloud API treats a slow ack as a failed delivery and
+        // REDELIVERS the webhook — observed in production as one message
+        // ingested 15× (~24s apart, then backoff to next-day), each
+        // redelivery re-running the agent and re-answering the user. The
+        // handler must ack 200 immediately and process in a spawned task,
+        // the way the Nextcloud Talk handler does.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let provider_impl = Arc::new(SlowProvider {
+            calls: AtomicUsize::new(0),
+            started_tx: Mutex::new(Some(started_tx)),
+        });
+
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        let wa = Arc::new(WhatsAppChannel::new(
+            "access-token".into(),
+            "phone-number-id".into(),
+            "verify-tok".into(),
+            "work".to_string(),
+            peer_resolver,
+        ));
+
+        let mut state = webhook_baseline_state();
+        state.model_provider = provider_impl.clone();
+        state.whatsapp = HashMap::from([("work".to_string(), wa)]);
+        state.whatsapp_app_secret =
+            HashMap::from([("work".to_string(), Arc::<str>::from("app-secret"))]);
+
+        let body = br#"{"object":"whatsapp_business_account","entry":[{"id":"e","changes":[{"value":{"messages":[{"from":"1234567890","id":"wamid.ack-test","timestamp":"1699999999","type":"text","text":{"body":"hola"}}]},"field":"messages"}]}]}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&whatsapp_signature("app-secret", body)).unwrap(),
+        );
+
+        let start = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(2),
+            Box::pin(handle_whatsapp_message_alias(
+                State(state),
+                Path("work".to_string()),
+                headers,
+                Bytes::from_static(body),
+            )),
+        )
+        .await
+        .expect("webhook must ack before the 2s deadline, not after the LLM call");
+        let elapsed = start.elapsed();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "handler returned after {elapsed:?}; Meta would have redelivered by now"
+        );
+
+        // The ack must not have skipped processing: the spawned task's LLM
+        // call (still inside its 30s sleep) has actually started.
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("spawned LLM call did not start within 2s")
+            .expect("started_tx sender was dropped");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
     /// Build an `AppState` whose device registry points at a non-existent
