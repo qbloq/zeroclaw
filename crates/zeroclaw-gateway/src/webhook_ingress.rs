@@ -462,6 +462,22 @@ pub(crate) enum WebhookDispatchMode {
     FastAck,
 }
 
+/// Deferred, per-message preparation for `FastAck` dispatch (see
+/// [`WebhookDispatchContext::prepare`]).
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-whatsapp-cloud"
+))]
+pub(crate) type PrepareMessage = Arc<
+    dyn Fn(
+            ChannelMessage,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<ChannelMessage>> + Send + 'static>,
+        > + Send
+        + Sync,
+>;
+
 /// Handler-supplied wiring for the shared gateway-webhook dispatch helper.
 #[cfg(any(
     feature = "channel-linq",
@@ -471,6 +487,12 @@ pub(crate) enum WebhookDispatchMode {
 pub(crate) struct WebhookDispatchContext {
     /// Reply-delivery channel for agent responses and error fallbacks.
     pub(crate) channel: Arc<dyn Channel>,
+    /// Post-ack, per-message preparation run inside the `FastAck` task
+    /// before dispatch: resolve content the webhook only referenced (a
+    /// WhatsApp voice note behind a Meta media id). Returning `None` drops
+    /// the message — a placeholder must never become the agent's prompt.
+    /// Ignored by `Synchronous` dispatch.
+    pub(crate) prepare: Option<PrepareMessage>,
     /// Autosave key derivation for inbound messages.
     pub(crate) memory_key: fn(&ChannelMessage) -> String,
     /// Configured agent alias override; `None` uses the gateway default
@@ -539,9 +561,17 @@ pub(crate) async fn dispatch_verified_webhook(
                 let alias = alias.clone();
                 let agent_override = ctx.agent_override.clone();
                 let memory_key = ctx.memory_key;
+                let prepare = ctx.prepare.clone();
                 #[cfg(test)]
                 let suppress_reply_send = ctx.suppress_reply_send;
                 zeroclaw_spawn::spawn!(async move {
+                    let msg = match prepare {
+                        Some(prepare) => match prepare(msg).await {
+                            Some(msg) => msg,
+                            None => return,
+                        },
+                        None => msg,
+                    };
                     process_verified_message(
                         &state,
                         spec,

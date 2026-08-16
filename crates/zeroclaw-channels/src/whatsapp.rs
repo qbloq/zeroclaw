@@ -203,6 +203,27 @@ fn ensure_https(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Placeholder content carried by a voice-note message between the parser
+/// (which runs before the webhook ack and must stay fast) and the post-ack
+/// resolution that downloads and transcribes it. Never reaches the agent:
+/// resolution either replaces it with the transcript or drops the message.
+pub(crate) const VOICE_PENDING_CONTENT: &str = "[voice-note]";
+
+/// Meta Graph API base. Matches the version used by the outbound send paths.
+const DEFAULT_GRAPH_BASE_URL: &str = "https://graph.facebook.com/v18.0";
+
+/// Everything needed to turn an inbound WhatsApp voice note into text, kept
+/// out of `ChannelMessage` because it is Cloud-API plumbing, not a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingVoice {
+    /// Meta media id — resolved to a signed download URL at fetch time.
+    pub media_id: String,
+    pub mime_type: Option<String>,
+    /// Group vs DM, decided by the parser; mention gating is applied to the
+    /// transcript once it exists, and the two rule sets differ.
+    pub is_group: bool,
+}
+
 pub struct WhatsAppChannel {
     access_token: String,
     endpoint_id: String,
@@ -226,6 +247,12 @@ pub struct WhatsAppChannel {
     /// std Mutex (not tokio): `parse_webhook_payload` is sync and the lock is
     /// held only for the check-and-insert.
     seen_wamids: std::sync::Mutex<WamidDedup>,
+    /// Voice-note transcription (STT). `None` disables it: audio messages are
+    /// then dropped by the parser exactly as before.
+    transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
+    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    /// Graph API base, overridable in tests. Production is v18.0.
+    graph_base_url: String,
 }
 
 impl WhatsAppChannel {
@@ -247,7 +274,57 @@ impl WhatsAppChannel {
             group_mention_patterns: Vec::new(),
             approval_timeout_secs: 300,
             seen_wamids: std::sync::Mutex::new(WamidDedup::new()),
+            transcription: None,
+            transcription_manager: None,
+            graph_base_url: DEFAULT_GRAPH_BASE_URL.to_string(),
         }
+    }
+
+    /// Enable voice-note transcription (STT) for inbound audio messages.
+    /// A manager that fails to build leaves transcription off rather than
+    /// killing the channel — audio then keeps being skipped as before.
+    pub fn with_transcription(
+        mut self,
+        config: zeroclaw_config::schema::TranscriptionConfig,
+    ) -> Self {
+        if !config.enabled {
+            return self;
+        }
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                // The manager does not pick a provider on its own; with
+                // exactly one configured, bind it as the agent's provider so
+                // `transcribe()` has somewhere to route to.
+                let names = m.available_providers();
+                let m = if names.len() == 1 {
+                    let only = names[0].to_string();
+                    m.with_agent_transcription_provider(only)
+                } else {
+                    m
+                };
+                self.transcription_manager = Some(Arc::new(m));
+                self.transcription = Some(config);
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "transcription manager init failed, WhatsApp voice transcription disabled"
+                );
+            }
+        }
+        self
+    }
+
+    /// Override the Graph API base URL used for media downloads. Defaults to
+    /// [`DEFAULT_GRAPH_BASE_URL`]. Overriding it does NOT relax the HTTPS
+    /// requirement on the signed URL Meta hands back — see
+    /// `validate_media_url`.
+    pub fn with_graph_base_url(mut self, url: &str) -> Self {
+        self.graph_base_url = url.trim_end_matches('/').to_string();
+        self
     }
 
     /// Return the alias under `[channels.whatsapp.<alias>]` that this
@@ -525,8 +602,19 @@ impl WhatsAppChannel {
                                 continue;
                             }
                         }
+                    } else if msg.get("audio").is_some() {
+                        // Voice note. The audio itself is behind a Meta media
+                        // id — two HTTP hops plus an STT call — and none of
+                        // that may run here: this is pre-ack, and a slow ack
+                        // is exactly what makes Meta redeliver the webhook.
+                        // So only mark it; `pending_voice_media` gives the
+                        // gateway the reference to resolve after the ack.
+                        if !self.voice_note_is_transcribable(msg) {
+                            continue;
+                        }
+                        VOICE_PENDING_CONTENT.to_string()
                     } else {
-                        // Could be image, audio, etc. — skip for now
+                        // Could be image, video, document, etc. — skip for now
                         ::zeroclaw_log::record!(
                             DEBUG,
                             ::zeroclaw_log::Event::new(
@@ -553,31 +641,36 @@ impl WhatsAppChannel {
                     // we sent — the bot's own UI counts as an explicit
                     // interaction with the bot, so the mention requirement
                     // (intended to gate freeform messages) does not apply.
+                    //
+                    // A pending voice note bypasses it too, for a different
+                    // reason: its text does not exist yet. Gating is applied
+                    // to the transcript in `resolve_voice_content`.
                     let is_group = Self::is_group_message(msg);
-                    let content = if content.starts_with("[choice]") {
-                        content
-                    } else {
-                        match Self::apply_mention_gating(
-                            &self.dm_mention_patterns,
-                            &self.group_mention_patterns,
-                            &content,
-                            is_group,
-                        ) {
-                            Some(c) => c,
-                            None => {
-                                ::zeroclaw_log::record!(
-                                    DEBUG,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    )
-                                    .with_attrs(::serde_json::json!({"from": from})),
-                                    "WhatsApp message did not match mention patterns, dropping"
-                                );
-                                continue;
+                    let content =
+                        if content.starts_with("[choice]") || content == VOICE_PENDING_CONTENT {
+                            content
+                        } else {
+                            match Self::apply_mention_gating(
+                                &self.dm_mention_patterns,
+                                &self.group_mention_patterns,
+                                &content,
+                                is_group,
+                            ) {
+                                Some(c) => c,
+                                None => {
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(::serde_json::json!({"from": from})),
+                                        "WhatsApp message did not match mention patterns, dropping"
+                                    );
+                                    continue;
+                                }
                             }
-                        }
-                    };
+                        };
 
                     // Get timestamp
                     let timestamp = msg
@@ -616,6 +709,236 @@ impl WhatsAppChannel {
         }
 
         messages
+    }
+
+    /// Whether this `type: "audio"` message should become a transcript.
+    ///
+    /// The single predicate behind both the parser's mark and
+    /// `pending_voice_media`'s extraction — they must never disagree, or a
+    /// message gets marked pending with nothing to resolve it.
+    fn voice_note_is_transcribable(&self, msg: &serde_json::Value) -> bool {
+        if self.transcription_manager.is_none() {
+            return false;
+        }
+        let Some(audio) = msg.get("audio") else {
+            return false;
+        };
+        // A media id is the only handle on the bytes.
+        if !audio
+            .get("id")
+            .and_then(|i| i.as_str())
+            .is_some_and(|id| !id.is_empty())
+        {
+            return false;
+        }
+        // `voice: true` = recorded in the chat. `false` = a forwarded audio
+        // file, which bills STT for arbitrary media, so it stays opt-in.
+        let is_ptt = audio
+            .get("voice")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        is_ptt
+            || self
+                .transcription
+                .as_ref()
+                .is_some_and(|c| c.transcribe_non_ptt_audio)
+    }
+
+    /// Media references for the voice notes in `payload`, keyed by wamid.
+    ///
+    /// Sync and cheap on purpose: the gateway calls this alongside
+    /// `parse_webhook_payload`, both before the ack. The payload — not the
+    /// message content — is the authority on what is a voice note, so a user
+    /// typing the marker verbatim resolves to nothing.
+    pub fn pending_voice_media(
+        &self,
+        payload: &serde_json::Value,
+    ) -> std::collections::HashMap<String, PendingVoice> {
+        let mut pending = std::collections::HashMap::new();
+        let Some(entries) = payload.get("entry").and_then(|e| e.as_array()) else {
+            return pending;
+        };
+        for entry in entries {
+            let Some(changes) = entry.get("changes").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            for change in changes {
+                let Some(msgs) = change
+                    .get("value")
+                    .and_then(|v| v.get("messages"))
+                    .and_then(|m| m.as_array())
+                else {
+                    continue;
+                };
+                for msg in msgs {
+                    if !self.voice_note_is_transcribable(msg) {
+                        continue;
+                    }
+                    let (Some(wamid), Some(audio)) =
+                        (msg.get("id").and_then(|i| i.as_str()), msg.get("audio"))
+                    else {
+                        continue;
+                    };
+                    let Some(media_id) = audio.get("id").and_then(|i| i.as_str()) else {
+                        continue;
+                    };
+                    pending.insert(
+                        wamid.to_string(),
+                        PendingVoice {
+                            media_id: media_id.to_string(),
+                            mime_type: audio
+                                .get("mime_type")
+                                .and_then(|m| m.as_str())
+                                .map(str::to_string),
+                            is_group: Self::is_group_message(msg),
+                        },
+                    );
+                }
+            }
+        }
+        pending
+    }
+
+    /// Gate the signed URL Meta returned before the bearer token is attached
+    /// to it. Production is plain "must be HTTPS": `graph_base_url` is only
+    /// overridable under `cfg(test)`, so the carve-out below does not exist
+    /// in a release build.
+    fn validate_media_url(&self, url: &str) -> anyhow::Result<()> {
+        // A local mock server can only speak HTTP. Accept it for that exact
+        // origin — anything pointing elsewhere still has to be HTTPS, so the
+        // guard stays meaningful under test.
+        #[cfg(test)]
+        if !self.graph_base_url.starts_with("https://") && url.starts_with(&self.graph_base_url) {
+            return Ok(());
+        }
+        ensure_https(url)
+    }
+
+    /// Resolve a Meta media id to its bytes. Two hops: the id yields a signed,
+    /// short-lived URL, which is then fetched with the same bearer token.
+    async fn download_media(&self, media_id: &str) -> anyhow::Result<Vec<u8>> {
+        let client = self.http_client();
+        let meta: serde_json::Value = client
+            .get(format!("{}/{}", self.graph_base_url, media_id))
+            .bearer_auth(&self.access_token)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let Some(url) = meta.get("url").and_then(|u| u.as_str()) else {
+            anyhow::bail!("Graph media response has no `url` field");
+        };
+
+        // The download carries the access token, so the URL Meta handed back
+        // must be HTTPS before we attach it.
+        self.validate_media_url(url)?;
+
+        let bytes = client
+            .get(url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        Ok(bytes.to_vec())
+    }
+
+    /// Download and transcribe a pending voice note into agent-ready content.
+    /// `None` means "drop this message": transcription off, download failed,
+    /// empty transcript, or the transcript failed mention gating. Every
+    /// `None` is logged — a silently vanishing voice note is undebuggable.
+    pub async fn resolve_voice_content(&self, pending: &PendingVoice) -> Option<String> {
+        let manager = self.transcription_manager.as_deref()?;
+
+        let audio = match self.download_media(&pending.media_id).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "media_id": pending.media_id,
+                        })),
+                    "failed to download WhatsApp voice note"
+                );
+                return None;
+            }
+        };
+
+        // Global size guard, checked before dispatching to a billed provider.
+        if let Some(max) = self.transcription.as_ref().and_then(|c| c.max_audio_bytes)
+            && audio.len() > max
+        {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"bytes": audio.len(), "max": max})),
+                "skipping WhatsApp voice note over max_audio_bytes"
+            );
+            return None;
+        }
+
+        // The STT providers dispatch on the file extension.
+        let file_name = match pending.mime_type.as_deref() {
+            Some(m) if m.contains("opus") || m.contains("ogg") => "voice.ogg",
+            Some(m) if m.contains("mp4") || m.contains("m4a") => "voice.m4a",
+            Some(m) if m.contains("mpeg") || m.contains("mp3") => "voice.mp3",
+            Some(m) if m.contains("webm") => "voice.webm",
+            Some(m) if m.contains("wav") => "voice.wav",
+            _ => "voice.ogg", // WhatsApp's default container
+        };
+
+        let transcript = match manager.transcribe(&audio, file_name).await {
+            Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+            Ok(_) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "WhatsApp voice transcription returned empty text, dropping"
+                );
+                return None;
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "WhatsApp voice transcription failed"
+                );
+                return None;
+            }
+        };
+
+        // Mention gating could not run in the parser (no text yet), so it
+        // runs here, against the transcript.
+        let gated = Self::apply_mention_gating(
+            &self.dm_mention_patterns,
+            &self.group_mention_patterns,
+            &transcript,
+            pending.is_group,
+        );
+        let Some(gated) = gated else {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "WhatsApp voice transcript did not match mention patterns, dropping"
+            );
+            return None;
+        };
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"chars": gated.len()})),
+            "WhatsApp voice note transcribed"
+        );
+        Some(format!("[Voice] {gated}"))
     }
 
     /// Send an interactive button message (≤ 3 buttons per Meta's Cloud
@@ -1245,6 +1568,196 @@ mod tests {
                 }]
             }]
         })
+    }
+
+    /// A Cloud API voice-note webhook. `voice: true` is what Meta sets for a
+    /// note recorded in the chat; an audio FILE forwarded from the gallery
+    /// arrives as the same `type: "audio"` with `voice: false`.
+    fn voice_message_payload(wamid: &str, media_id: &str, voice: bool) -> serde_json::Value {
+        serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "id": "123",
+                "changes": [{
+                    "value": { "messages": [{
+                        "from": "1234567890",
+                        "id": wamid,
+                        "timestamp": "1699999999",
+                        "type": "audio",
+                        "audio": {
+                            "id": media_id,
+                            "mime_type": "audio/ogg; codecs=opus",
+                            "voice": voice
+                        }
+                    }] },
+                    "field": "messages"
+                }]
+            }]
+        })
+    }
+
+    fn transcribing_channel(whisper_url: &str) -> WhatsAppChannel {
+        make_channel().with_transcription(zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                url: whisper_url.to_string(),
+                bearer_token: None,
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn whatsapp_voice_note_is_marked_pending_for_post_ack_resolution() {
+        // The bytes live behind a Meta media id: two HTTP hops plus an STT
+        // call. None of that may happen in the parser, which runs BEFORE the
+        // webhook is acked — a slow ack is what makes Meta redeliver. So the
+        // parser only marks the message; the gateway resolves it after the ack.
+        let ch = transcribing_channel("http://127.0.0.1:9/v1/transcribe");
+        let msgs =
+            ch.parse_webhook_payload(&voice_message_payload("wamid.voice1", "media-abc", true));
+        assert_eq!(msgs.len(), 1, "a voice note must survive the parser");
+        assert_eq!(msgs[0].content, VOICE_PENDING_CONTENT);
+        assert_eq!(msgs[0].id, "wamid.voice1");
+    }
+
+    #[test]
+    fn whatsapp_voice_note_skipped_when_transcription_not_configured() {
+        // Without a transcription provider there is nothing to resolve into,
+        // so the message must be dropped in the parser rather than reach the
+        // agent as a bare marker.
+        let ch = make_channel();
+        let msgs =
+            ch.parse_webhook_payload(&voice_message_payload("wamid.voice2", "media-abc", true));
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_forwarded_audio_file_is_not_transcribed_by_default() {
+        // `voice: false` is a forwarded audio file, not someone talking to
+        // the bot. Transcribing those bills STT for arbitrary media, so it
+        // stays behind `transcribe_non_ptt_audio`.
+        let ch = transcribing_channel("http://127.0.0.1:9/v1/transcribe");
+        let msgs =
+            ch.parse_webhook_payload(&voice_message_payload("wamid.voice3", "media-abc", false));
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_pending_voice_media_carries_the_media_id() {
+        let ch = transcribing_channel("http://127.0.0.1:9/v1/transcribe");
+        let payload = voice_message_payload("wamid.voice4", "media-xyz", true);
+        let pending = ch.pending_voice_media(&payload);
+        assert_eq!(
+            pending.get("wamid.voice4").map(|p| p.media_id.as_str()),
+            Some("media-xyz")
+        );
+    }
+
+    #[test]
+    fn whatsapp_pending_voice_media_ignores_a_spoofed_text_body() {
+        // The authority on "is this a voice note" is the payload's message
+        // type, never the content string — otherwise a user could type the
+        // marker verbatim and make the gateway chase a bogus media id.
+        let ch = transcribing_channel("http://127.0.0.1:9/v1/transcribe");
+        let payload = text_message_payload(Some("wamid.spoof"), VOICE_PENDING_CONTENT);
+        assert!(ch.pending_voice_media(&payload).is_empty());
+    }
+
+    #[tokio::test]
+    async fn whatsapp_resolve_voice_content_downloads_and_transcribes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let graph = MockServer::start().await;
+        let whisper = MockServer::start().await;
+
+        // Hop 1: media id -> signed download URL.
+        Mock::given(method("GET"))
+            .and(path("/media-abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": format!("{}/download", graph.uri()),
+                "mime_type": "audio/ogg; codecs=opus",
+            })))
+            .mount(&graph)
+            .await;
+        // Hop 2: the bytes.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"OggS-fake-audio".to_vec()))
+            .mount(&graph)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "hola socio, pásame el reporte"})),
+            )
+            .mount(&whisper)
+            .await;
+
+        let ch = transcribing_channel(&format!("{}/v1/transcribe", whisper.uri()))
+            .with_graph_base_url(&graph.uri());
+        let pending = PendingVoice {
+            media_id: "media-abc".into(),
+            mime_type: Some("audio/ogg; codecs=opus".into()),
+            is_group: false,
+        };
+
+        assert_eq!(
+            ch.resolve_voice_content(&pending).await.as_deref(),
+            Some("[Voice] hola socio, pásame el reporte"),
+            "the agent must receive the transcript under the [Voice] convention"
+        );
+    }
+
+    #[tokio::test]
+    async fn whatsapp_resolve_voice_content_refuses_non_https_media_url() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let graph = MockServer::start().await;
+        // A REACHABLE plain-HTTP host standing in for a tampered or
+        // misconfigured media URL. It must stay untouched: reaching it at all
+        // means the Bearer access token travelled with the request. (An
+        // unreachable hostname would make this test pass on a connection
+        // error instead of on the guard.)
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"stolen".to_vec()))
+            .mount(&elsewhere)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/media-abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": format!("{}/steal", elsewhere.uri()),
+            })))
+            .mount(&graph)
+            .await;
+
+        let ch = transcribing_channel("http://127.0.0.1:9/v1/transcribe")
+            .with_graph_base_url(&graph.uri());
+        let pending = PendingVoice {
+            media_id: "media-abc".into(),
+            mime_type: None,
+            is_group: false,
+        };
+
+        assert_eq!(
+            ch.resolve_voice_content(&pending).await,
+            None,
+            "a non-HTTPS media URL must abort the download"
+        );
+        assert!(
+            elsewhere
+                .received_requests()
+                .await
+                .is_some_and(|r| r.is_empty()),
+            "the access token must never be sent to a non-HTTPS media URL"
+        );
     }
 
     #[test]

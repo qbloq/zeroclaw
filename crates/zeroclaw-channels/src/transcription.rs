@@ -456,12 +456,21 @@ impl TranscriptionProvider for DeepgramProvider {
 pub struct AssemblyAiProvider {
     alias: String,
     api_key: String,
+    /// ISO-639-1 hint sent as `language_code`. `None` leaves AssemblyAI on
+    /// its own default, which is English.
+    language: Option<String>,
+    /// API base, overridable for tests. Production is `ASSEMBLYAI_API_BASE`.
+    api_base: String,
 }
+
+/// AssemblyAI's public API root.
+const ASSEMBLYAI_API_BASE: &str = "https://api.assemblyai.com";
 
 impl AssemblyAiProvider {
     pub fn from_config(
         alias: &str,
         config: &zeroclaw_config::schema::AssemblyAiSttConfig,
+        language: Option<&str>,
     ) -> Result<Self> {
         let api_key = config
             .api_key
@@ -474,6 +483,11 @@ impl AssemblyAiProvider {
         Ok(Self {
             alias: alias.to_string(),
             api_key,
+            language: language
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned),
+            api_base: ASSEMBLYAI_API_BASE.to_string(),
         })
     }
 
@@ -497,7 +511,21 @@ impl AssemblyAiProvider {
         Ok(Self {
             alias: alias.to_string(),
             api_key,
+            language: cfg
+                .base
+                .language
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned),
+            api_base: ASSEMBLYAI_API_BASE.to_string(),
         })
+    }
+
+    /// Override the API base URL. Defaults to [`ASSEMBLYAI_API_BASE`].
+    pub fn with_api_base(mut self, url: &str) -> Self {
+        self.api_base = url.trim_end_matches('/').to_string();
+        self
     }
 }
 
@@ -515,7 +543,7 @@ impl TranscriptionProvider for AssemblyAiProvider {
 
         // Step 1: Upload the audio file.
         let upload_resp = client
-            .post("https://api.assemblyai.com/v2/upload")
+            .post(format!("{}/v2/upload", self.api_base))
             .header("Authorization", &self.api_key)
             .header("Content-Type", "application/octet-stream")
             .body(audio_data.to_vec())
@@ -539,13 +567,19 @@ impl TranscriptionProvider for AssemblyAiProvider {
             .as_str()
             .context("AssemblyAI upload response missing 'upload_url'")?;
 
-        // Step 2: Create transcription job.
-        let transcript_req = serde_json::json!({
+        // Step 2: Create transcription job. Without an explicit
+        // `language_code` AssemblyAI assumes English, which turns a Spanish
+        // voice note into nonsense — so the configured hint is sent whenever
+        // there is one.
+        let mut transcript_req = serde_json::json!({
             "audio_url": upload_url,
         });
+        if let Some(ref language) = self.language {
+            transcript_req["language_code"] = serde_json::json!(language);
+        }
 
         let create_resp = client
-            .post("https://api.assemblyai.com/v2/transcript")
+            .post(format!("{}/v2/transcript", self.api_base))
             .header("Authorization", &self.api_key)
             .json(&transcript_req)
             .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
@@ -573,7 +607,7 @@ impl TranscriptionProvider for AssemblyAiProvider {
             .context("AssemblyAI response missing 'id'")?;
 
         // Step 3: Poll for completion.
-        let poll_url = format!("https://api.assemblyai.com/v2/transcript/{transcript_id}");
+        let poll_url = format!("{}/v2/transcript/{transcript_id}", self.api_base);
         let poll_interval = std::time::Duration::from_secs(3);
         let poll_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
 
@@ -1043,7 +1077,11 @@ impl TranscriptionManager {
         }
 
         if let Some(ref assemblyai_cfg) = config.assemblyai
-            && let Ok(p) = AssemblyAiProvider::from_config("assemblyai", assemblyai_cfg)
+            && let Ok(p) = AssemblyAiProvider::from_config(
+                "assemblyai",
+                assemblyai_cfg,
+                config.language.as_deref(),
+            )
         {
             transcription_providers.insert("assemblyai".to_string(), Box::new(p));
         }
@@ -1908,6 +1946,60 @@ mod tests {
         );
         assert!(err.to_string().contains("global max 2"), "got: {err}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn assemblyai_sends_the_configured_language_code() {
+        // AssemblyAI defaults to English when the request carries no
+        // `language_code`. Sending Spanish voice notes without it returns
+        // English-shaped nonsense, so the configured language must reach the
+        // transcription job.
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"upload_url": "https://cdn.assemblyai.com/upload/x"}),
+            ))
+            .mount(&server)
+            .await;
+        // The assertion lives in the matcher: without `language_code: "es"`
+        // this mock never matches and the transcription call fails.
+        Mock::given(method("POST"))
+            .and(path("/v2/transcript"))
+            .and(body_partial_json(
+                serde_json::json!({"language_code": "es"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "t1"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/transcript/t1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"status": "completed", "text": "hola socio"}),
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = AssemblyAiProvider::from_config(
+            "assemblyai",
+            &zeroclaw_config::schema::AssemblyAiSttConfig {
+                api_key: Some("k".into()),
+            },
+            Some("es"),
+        )
+        .expect("provider builds")
+        .with_api_base(&server.uri());
+
+        let text = provider
+            .transcribe(b"OggS-fake-audio", "voice.ogg")
+            .await
+            .expect("transcription succeeds");
+        assert_eq!(text, "hola socio");
     }
 
     #[test]

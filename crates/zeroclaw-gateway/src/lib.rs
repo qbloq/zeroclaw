@@ -1024,13 +1024,18 @@ pub async fn run_gateway(
             };
             (
                 alias.clone(),
-                Arc::new(WhatsAppChannel::new(
-                    wa.access_token.clone().unwrap_or_default(),
-                    wa.phone_number_id.clone().unwrap_or_default(),
-                    wa.verify_token.clone().unwrap_or_default(),
-                    alias.clone(),
-                    peer_resolver,
-                )),
+                Arc::new(
+                    WhatsAppChannel::new(
+                        wa.access_token.clone().unwrap_or_default(),
+                        wa.phone_number_id.clone().unwrap_or_default(),
+                        wa.verify_token.clone().unwrap_or_default(),
+                        alias.clone(),
+                        peer_resolver,
+                    )
+                    // Inbound voice notes: transcribed post-ack, same
+                    // `[transcription]` config every other channel uses.
+                    .with_transcription(config.transcription.clone()),
+                ),
             )
         })
         .collect();
@@ -3291,6 +3296,7 @@ async fn process_whatsapp_message(
         Err(refusal) => return refusal.into_response(&webhook_ingress::WHATSAPP_WEBHOOK),
     };
 
+    let mut pending_voice = std::collections::HashMap::new();
     let mut verified = match verified.parse_messages(|body| {
         let payload = serde_json::from_slice::<serde_json::Value>(body).map_err(|_| {
             (
@@ -3298,6 +3304,7 @@ async fn process_whatsapp_message(
                 Json(serde_json::json!({"error": "Invalid JSON payload"})),
             )
         })?;
+        pending_voice = wa.pending_voice_media(&payload);
         Ok::<_, (StatusCode, Json<serde_json::Value>)>(wa.parse_webhook_payload(&payload))
     }) {
         Ok(verified) => verified,
@@ -3320,6 +3327,34 @@ async fn process_whatsapp_message(
     });
     drop(approvals);
 
+    // Voice notes leave the parser as a placeholder plus a media reference:
+    // fetching and transcribing the audio is three network round-trips and
+    // must not delay the ack. Extraction (above, alongside the parse) is sync
+    // and cheap; the resolution runs post-ack, inside the FastAck task, and a
+    // note that cannot be transcribed is dropped rather than dispatched.
+    let prepare: Option<webhook_ingress::PrepareMessage> = if pending_voice.is_empty() {
+        None
+    } else {
+        let wa = Arc::clone(wa);
+        let pending_voice = Arc::new(std::sync::Mutex::new(pending_voice));
+        Some(Arc::new(move |mut msg: zeroclaw_api::channel::ChannelMessage| {
+            let wa = Arc::clone(&wa);
+            let pending = pending_voice
+                .lock()
+                .expect("pending voice lock poisoned")
+                .remove(&msg.id);
+            Box::pin(async move {
+                if let Some(pending) = pending {
+                    match wa.resolve_voice_content(&pending).await {
+                        Some(text) => msg.content = text,
+                        None => return None,
+                    }
+                }
+                Some(msg)
+            })
+        }))
+    };
+
     // FastAck: Meta treats a slow ack as a failed delivery and REDELIVERS the
     // webhook with backoff for days, re-running the agent once per redelivery.
     // Redeliveries that still arrive are dropped by wamid in
@@ -3330,6 +3365,7 @@ async fn process_whatsapp_message(
         verified,
         webhook_ingress::WebhookDispatchContext {
             channel,
+            prepare,
             memory_key: whatsapp_memory_key,
             agent_override: None,
             mode: webhook_ingress::WebhookDispatchMode::FastAck,
@@ -3468,6 +3504,7 @@ async fn process_linq_webhook(
         verified,
         webhook_ingress::WebhookDispatchContext {
             channel,
+            prepare: None,
             memory_key: linq_memory_key,
             agent_override,
             mode: webhook_ingress::WebhookDispatchMode::Synchronous,
@@ -3583,6 +3620,7 @@ async fn process_nextcloud_talk_webhook(
         verified,
         webhook_ingress::WebhookDispatchContext {
             channel,
+            prepare: None,
             memory_key: nextcloud_talk_memory_key,
             agent_override: None,
             mode: webhook_ingress::WebhookDispatchMode::FastAck,
@@ -9311,6 +9349,7 @@ path = "{trigger_path}"
             verified,
             webhook_ingress::WebhookDispatchContext {
                 channel,
+                prepare: None,
                 memory_key: linq_memory_key,
                 agent_override: None,
                 mode: webhook_ingress::WebhookDispatchMode::Synchronous,
@@ -9368,6 +9407,7 @@ path = "{trigger_path}"
             verified,
             webhook_ingress::WebhookDispatchContext {
                 channel,
+                prepare: None,
                 memory_key: linq_memory_key,
                 agent_override: None,
                 mode: webhook_ingress::WebhookDispatchMode::Synchronous,
@@ -9819,6 +9859,73 @@ path = "{trigger_path}"
             .expect("spawned LLM call did not start within 2s")
             .expect("started_tx sender was dropped");
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn whatsapp_voice_note_that_cannot_be_transcribed_never_reaches_the_agent() {
+        // A voice note leaves the parser carrying only a placeholder: the
+        // audio is behind a Meta media id that can only be fetched after the
+        // ack. The gateway must replace that placeholder with the transcript
+        // — and when it can't, drop the message. The agent must never be
+        // handed the raw marker (which is what happens if the wiring is
+        // missing entirely).
+        let provider_impl = Arc::new(SlowProvider::default());
+
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        let wa = Arc::new(
+            WhatsAppChannel::new(
+                "access-token".into(),
+                "phone-number-id".into(),
+                "verify-tok".into(),
+                "work".to_string(),
+                peer_resolver,
+            )
+            .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                    url: "http://127.0.0.1:1/v1/transcribe".into(),
+                    bearer_token: None,
+                    max_audio_bytes: 10 * 1024 * 1024,
+                    timeout_secs: 5,
+                }),
+                ..Default::default()
+            })
+            // Nothing listens on port 1: the media download fails fast and
+            // the test never touches the network.
+            .with_graph_base_url("http://127.0.0.1:1"),
+        );
+
+        let mut state = webhook_baseline_state();
+        state.model_provider = provider_impl.clone();
+        state.whatsapp = HashMap::from([("work".to_string(), wa)]);
+        state.whatsapp_app_secret =
+            HashMap::from([("work".to_string(), Arc::<str>::from("app-secret"))]);
+
+        let body = br#"{"object":"whatsapp_business_account","entry":[{"id":"e","changes":[{"value":{"messages":[{"from":"1234567890","id":"wamid.voice-gw","timestamp":"1699999999","type":"audio","audio":{"id":"media-abc","mime_type":"audio/ogg; codecs=opus","voice":true}}]},"field":"messages"}]}]}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&whatsapp_signature("app-secret", body)).unwrap(),
+        );
+
+        let resp = Box::pin(handle_whatsapp_message_alias(
+            State(state),
+            Path("work".to_string()),
+            headers,
+            Bytes::from_static(body),
+        ))
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Let the spawned task run to its failure.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            provider_impl.calls.load(Ordering::SeqCst),
+            0,
+            "an unresolved voice note must be dropped, never sent to the agent as a placeholder"
+        );
     }
 
     /// Build an `AppState` whose device registry points at a non-existent
