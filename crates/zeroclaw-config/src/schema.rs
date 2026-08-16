@@ -5958,7 +5958,7 @@ pub struct DeepgramSttConfig {
 }
 
 /// AssemblyAI STT model_provider configuration (`[transcription.assemblyai]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.assemblyai"]
 pub struct AssemblyAiSttConfig {
@@ -5968,6 +5968,31 @@ pub struct AssemblyAiSttConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
+    /// Speech models in priority order, sent as `speech_models`.
+    ///
+    /// Omitting the field from the REQUEST is not the same as leaving this
+    /// unset: AssemblyAI then applies its own default of
+    /// `["universal-3-pro", "universal-2"]`, a generation behind. The default
+    /// here matches what the org already runs in production; the trailing
+    /// entry is the fallback used when the leading model is unavailable.
+    #[serde(default = "default_assemblyai_speech_models")]
+    pub speech_models: Vec<String>,
+}
+
+/// `Default` is hand-written so it agrees with the serde default above — a
+/// derived one would yield an empty model list and silently downgrade the
+/// request to AssemblyAI's older default.
+impl Default for AssemblyAiSttConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            speech_models: default_assemblyai_speech_models(),
+        }
+    }
+}
+
+fn default_assemblyai_speech_models() -> Vec<String> {
+    vec!["universal-3-5-pro".to_string(), "universal-2".to_string()]
 }
 
 /// Google Cloud Speech-to-Text model_provider configuration (`[transcription.google]`).

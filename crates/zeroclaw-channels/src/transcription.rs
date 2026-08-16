@@ -456,15 +456,22 @@ impl TranscriptionProvider for DeepgramProvider {
 pub struct AssemblyAiProvider {
     alias: String,
     api_key: String,
-    /// ISO-639-1 hint sent as `language_code`. `None` leaves AssemblyAI on
-    /// its own default, which is English.
+    /// ISO-639-1 hint sent as `language_code`. `None` asks AssemblyAI to
+    /// detect the language instead.
     language: Option<String>,
+    /// Speech models in priority order, sent as `speech_models`.
+    speech_models: Vec<String>,
     /// API base, overridable for tests. Production is `ASSEMBLYAI_API_BASE`.
     api_base: String,
 }
 
 /// AssemblyAI's public API root.
 const ASSEMBLYAI_API_BASE: &str = "https://api.assemblyai.com";
+
+/// Fallback model list, mirroring the schema default.
+fn default_speech_models() -> Vec<String> {
+    vec!["universal-3-5-pro".to_string(), "universal-2".to_string()]
+}
 
 impl AssemblyAiProvider {
     pub fn from_config(
@@ -487,6 +494,13 @@ impl AssemblyAiProvider {
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(ToOwned::to_owned),
+            // An empty list would silently downgrade the request to
+            // AssemblyAI's older default, so treat it as "unset".
+            speech_models: if config.speech_models.is_empty() {
+                default_speech_models()
+            } else {
+                config.speech_models.clone()
+            },
             api_base: ASSEMBLYAI_API_BASE.to_string(),
         })
     }
@@ -518,6 +532,7 @@ impl AssemblyAiProvider {
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(ToOwned::to_owned),
+            speech_models: default_speech_models(),
             api_base: ASSEMBLYAI_API_BASE.to_string(),
         })
     }
@@ -567,15 +582,23 @@ impl TranscriptionProvider for AssemblyAiProvider {
             .as_str()
             .context("AssemblyAI upload response missing 'upload_url'")?;
 
-        // Step 2: Create transcription job. Without an explicit
-        // `language_code` AssemblyAI assumes English, which turns a Spanish
-        // voice note into nonsense — so the configured hint is sent whenever
-        // there is one.
+        // Step 2: Create transcription job.
+        //
+        // `speech_models` is sent explicitly because omitting it is NOT the
+        // same as taking the best model: AssemblyAI then applies its own
+        // default of ["universal-3-pro", "universal-2"], a generation behind
+        // what the org runs elsewhere.
+        //
+        // Language: an explicitly configured one pins transcription; with
+        // none, ask for detection. Sending neither would silently assume
+        // English, and sending both would contradict.
         let mut transcript_req = serde_json::json!({
             "audio_url": upload_url,
+            "speech_models": self.speech_models,
         });
-        if let Some(ref language) = self.language {
-            transcript_req["language_code"] = serde_json::json!(language);
+        match self.language {
+            Some(ref language) => transcript_req["language_code"] = serde_json::json!(language),
+            None => transcript_req["language_detection"] = serde_json::json!(true),
         }
 
         let create_resp = client
@@ -1948,13 +1971,11 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
-    async fn assemblyai_sends_the_configured_language_code() {
-        // AssemblyAI defaults to English when the request carries no
-        // `language_code`. Sending Spanish voice notes without it returns
-        // English-shaped nonsense, so the configured language must reach the
-        // transcription job.
-        use wiremock::matchers::{body_partial_json, method, path};
+    /// Run one AssemblyAI transcription against a mock server and return the
+    /// body of the create-job request, so tests can assert on what was sent
+    /// AND on what was deliberately left out.
+    async fn assemblyai_create_job_body(language: Option<&str>) -> serde_json::Value {
+        use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
@@ -1965,13 +1986,8 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        // The assertion lives in the matcher: without `language_code: "es"`
-        // this mock never matches and the transcription call fails.
         Mock::given(method("POST"))
             .and(path("/v2/transcript"))
-            .and(body_partial_json(
-                serde_json::json!({"language_code": "es"}),
-            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "t1"})))
             .mount(&server)
             .await;
@@ -1989,8 +2005,9 @@ mod tests {
             "assemblyai",
             &zeroclaw_config::schema::AssemblyAiSttConfig {
                 api_key: Some("k".into()),
+                ..Default::default()
             },
-            Some("es"),
+            language,
         )
         .expect("provider builds")
         .with_api_base(&server.uri());
@@ -2000,6 +2017,55 @@ mod tests {
             .await
             .expect("transcription succeeds");
         assert_eq!(text, "hola socio");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock server records requests");
+        let create = requests
+            .iter()
+            .find(|r| r.url.path() == "/v2/transcript" && r.method == wiremock::http::Method::POST)
+            .expect("the create-job request was sent");
+        serde_json::from_slice(&create.body).expect("create-job body is JSON")
+    }
+
+    #[tokio::test]
+    async fn assemblyai_sends_the_configured_language_code() {
+        // An explicitly configured language pins transcription to it, and
+        // must NOT also ask for detection — the two settings contradict.
+        let body = assemblyai_create_job_body(Some("es")).await;
+        assert_eq!(body["language_code"], "es");
+        assert!(
+            body.get("language_detection").is_none(),
+            "an explicit language must not also request detection: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assemblyai_detects_the_language_when_none_is_configured() {
+        // Meetico (the org's Google Meet pipeline) runs detection rather than
+        // pinning a language, and WhatsApp voice notes follow it. Without
+        // either field AssemblyAI would silently assume English.
+        let body = assemblyai_create_job_body(None).await;
+        assert_eq!(body["language_detection"], true);
+        assert!(
+            body.get("language_code").is_none(),
+            "detection must not be pinned to a language: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assemblyai_sends_the_speech_models_in_priority_order() {
+        // Omitting `speech_models` does NOT get the newest model: AssemblyAI
+        // defaults to ["universal-3-pro", "universal-2"], a generation behind
+        // the universal-3-5-pro the org already runs in production. The
+        // trailing universal-2 is the fallback if the newer one is
+        // unavailable.
+        let body = assemblyai_create_job_body(None).await;
+        assert_eq!(
+            body["speech_models"],
+            serde_json::json!(["universal-3-5-pro", "universal-2"])
+        );
     }
 
     #[test]
